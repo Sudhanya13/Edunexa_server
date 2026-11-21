@@ -45,37 +45,6 @@ app.get("/users", async (req, res) => {
   res.send(result);
 });
 
-// PUBLIC: approved + active, server-side search/filter/pagination
-// app.get("/tuitions", async (req, res) => {
-//   const { search, classLevel, mode, subject } = req.query;
-//   const page = Math.max(parseInt(req.query.page) || 1, 1);
-//   const limit = Math.min(parseInt(req.query.limit) || 9, 50);
-
-//   const query = { approvalStatus: "approved", isActive: true };
-//   if (search) {
-//     const rx = { $regex: escapeRegex(search), $options: "i" };
-//     query.$or = [{ title: rx }, { subject: rx }];
-//   }
-//   if (classLevel) query.classLevel = classLevel;
-//   if (mode) query.mode = mode;
-//   if (subject) query.subject = subject;
-
-//   const total = await tuitions.countDocuments(query);
-//   const list = await tuitions
-//     .find(query)
-//     .sort({ createdAt: -1 })
-//     .skip((page - 1) * limit)
-//     .limit(limit)
-//     .toArray();
-
-//   res.send({
-//     tuitions: list,
-//     total,
-//     page,
-//     totalPages: Math.ceil(total / limit),
-//   });
-// });
-
 app.get("/all-tuitions", async (req, res) => {
   try {
     const result = await allTuitions.find({}).toArray();
@@ -152,20 +121,58 @@ app.get("/all-tuitions/:id", async (req, res) => {
   }
 });
 
+// GET: Fetch applications submitted by a student
+app.get("/applications/student/:studentId", async (req, res) => {
+  try {
+    const { studentId } = req.params;
+
+    const result = await applications
+      .find({ studentId })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).send(result);
+  } catch (error) {
+    console.error("Error fetching student applications:", error);
+
+    res.status(500).send({
+      message: "Failed to fetch applications",
+    });
+  }
+});
+
+// GET: Check whether a student has applied for a tuition
+app.get("/applications/check/:studentId/:tuitionId", async (req, res) => {
+  try {
+    const { studentId, tuitionId } = req.params;
+
+    const application = await applications.findOne({
+      studentId,
+      tuitionId,
+    });
+
+    res.status(200).send({
+      hasApplied: Boolean(application),
+    });
+  } catch (error) {
+    console.error("Application check error:", error);
+
+    res.status(500).send({
+      message: "Failed to check application status",
+    });
+  }
+});
 // POST: Submit tuition application
 app.post("/applications", async (req, res) => {
   try {
     const {
       tuitionId,
-      tuitionTitle,
-      tutorEmail,
       studentId,
       studentName,
       studentEmail,
       phone,
       institution,
       message,
-      status,
     } = req.body;
 
     if (
@@ -181,25 +188,53 @@ app.post("/applications", async (req, res) => {
       });
     }
 
+    // Check whether this student has already applied
+    const existingApplication = await applications.findOne({
+      tuitionId,
+      studentId,
+    });
+
+    if (existingApplication) {
+      return res.status(409).send({
+        message: "You have already applied for this tuition",
+      });
+    }
+
+    // Fetch the tuition record
+    if (!ObjectId.isValid(tuitionId)) {
+      return res.status(400).send({ message: "Invalid tuition ID" });
+    }
+
+    const tuition = await allTuitions.findOne({
+      _id: new ObjectId(tuitionId),
+    });
+
+    if (!tuition) {
+      return res.status(404).send({ message: "Tuition not found" });
+    }
+
     const application = {
       tuitionId,
-      tuitionTitle,
-      tutorEmail,
+      tuitionTitle: tuition.title || "",
+      subject: tuition.subject || "",
+      tutorName: tuition.tutorName || tuition.mentor?.name || "Not provided",
+      tutorEmail: tuition.tutorEmail || tuition.mentor?.email || "",
+      monthlyFee: tuition.monthlyFee ?? tuition.salary ?? tuition.fee ?? 0,
+      currency: tuition.currency || "USD",
       studentId,
       studentName,
       studentEmail,
       phone,
       institution,
       message,
-      status: status || "Pending",
+      status: "Pending",
       createdAt: new Date(),
     };
 
-    const result = await applications.insertOne(application);
+    await applications.insertOne(application);
 
     res.status(201).send({
       message: "Application submitted successfully",
-      insertedId: result.insertedId,
     });
   } catch (error) {
     console.error("Application submission error:", error);
