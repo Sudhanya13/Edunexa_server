@@ -32,6 +32,9 @@ const connectedClient = await connectToMongoDB();
 const db = connectedClient.db("Edunexa");
 const users = db.collection("user");
 const allTuitions = db.collection("tuitions");
+const applications = db.collection("applications");
+// const payments = db.collection("payments");
+
 app.get("/", (req, res) => {
   res.send("Hello World!");
 });
@@ -121,6 +124,88 @@ app.get("/all-tuitions/latest", async (req, res) => {
     console.log(error);
     res.status(500).send({
       message: "Data fetching failed",
+    });
+  }
+});
+
+// PUBLIC: details
+app.get("/all-tuitions/:id", async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).send({ message: "Invalid id" });
+    }
+
+    const tuition = await allTuitions.findOne({
+      _id: new ObjectId(req.params.id),
+    });
+
+    if (!tuition) {
+      return res.status(404).send({ message: "Tuition not found" });
+    }
+
+    res.status(200).send(tuition);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: "Failed to fetch tuition details",
+    });
+  }
+});
+
+// POST: Submit tuition application
+app.post("/applications", async (req, res) => {
+  try {
+    const {
+      tuitionId,
+      tuitionTitle,
+      tutorEmail,
+      studentId,
+      studentName,
+      studentEmail,
+      phone,
+      institution,
+      message,
+      status,
+    } = req.body;
+
+    if (
+      !tuitionId ||
+      !studentId ||
+      !studentEmail ||
+      !phone ||
+      !institution ||
+      !message
+    ) {
+      return res.status(400).send({
+        message: "Please provide all required application details",
+      });
+    }
+
+    const application = {
+      tuitionId,
+      tuitionTitle,
+      tutorEmail,
+      studentId,
+      studentName,
+      studentEmail,
+      phone,
+      institution,
+      message,
+      status: status || "Pending",
+      createdAt: new Date(),
+    };
+
+    const result = await applications.insertOne(application);
+
+    res.status(201).send({
+      message: "Application submitted successfully",
+      insertedId: result.insertedId,
+    });
+  } catch (error) {
+    console.error("Application submission error:", error);
+
+    res.status(500).send({
+      message: "Failed to submit application",
     });
   }
 });
