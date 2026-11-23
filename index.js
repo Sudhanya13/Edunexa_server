@@ -1244,13 +1244,17 @@ app.get("/users", async (req, res) => {
 
 app.get("/all-tuitions", async (req, res) => {
   try {
-    const result = await allTuitions.find({}).toArray();
-
-    console.log(result);
+    const result = await allTuitions
+      .find({
+        status: "approved",
+        isActive: true,
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
 
     res.status(200).send(result);
   } catch (error) {
-    console.log(error);
+    console.error(error);
     res.status(500).send({ message: "Data fetching failed" });
   }
 });
@@ -2238,6 +2242,198 @@ app.post("/payments/confirm", async (req, res) => {
     return res.status(500).send({
       message: "Unable to confirm payment",
     });
+  }
+});
+
+// ==========================================
+// ADMIN: DASHBOARD OVERVIEW STATS
+// ==========================================
+app.get("/admin/stats", async (req, res) => {
+  try {
+    const [
+      totalUsers,
+      totalTutors,
+      pendingTuitions,
+      approvedTuitions,
+      paidPayments,
+    ] = await Promise.all([
+      users.countDocuments({}),
+      users.countDocuments({ role: "tutor" }),
+      allTuitions.countDocuments({ status: "pending" }),
+      allTuitions.countDocuments({ status: "approved" }),
+      payments
+        .find({ status: { $in: ["paid", "succeeded", "completed"] } })
+        .toArray(),
+    ]);
+
+    const totalRevenue = paidPayments.reduce(
+      (sum, item) => sum + Number(item.amount || 0),
+      0,
+    );
+
+    res.status(200).send({
+      totalUsers,
+      totalTutors,
+      pendingTuitions,
+      approvedTuitions,
+      totalRevenue,
+      currency: paidPayments[0]?.currency?.toUpperCase() || "USD",
+    });
+  } catch (error) {
+    console.error("Admin stats error:", error);
+    res.status(500).send({ message: "Failed to fetch admin statistics" });
+  }
+});
+
+// ==========================================
+// ADMIN: USER MANAGEMENT (LIST & ROLE UPDATE)
+// ==========================================
+app.get("/admin/users", async (req, res) => {
+  try {
+    const list = await users.find({}).sort({ createdAt: -1 }).toArray();
+    res.status(200).send(list);
+  } catch (error) {
+    console.error("Admin users fetch error:", error);
+    res.status(500).send({ message: "Failed to fetch users" });
+  }
+});
+
+app.patch("/admin/users/:id/role", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const role = String(req.body.role || "").toLowerCase();
+
+    if (!["student", "tutor", "admin"].includes(role)) {
+      return res.status(400).send({
+        message: "Role must be student, tutor, or admin",
+      });
+    }
+
+    // BetterAuth Mongo adapter can store `id` as string or `_id` as ObjectId/string
+    const filter = ObjectId.isValid(id)
+      ? { $or: [{ _id: new ObjectId(id) }, { _id: id }, { id }] }
+      : { $or: [{ _id: id }, { id }] };
+
+    const result = await users.updateOne(filter, {
+      $set: {
+        role,
+        updatedAt: new Date(),
+      },
+    });
+
+    if (!result.matchedCount) {
+      return res.status(404).send({ message: "User not found" });
+    }
+
+    res.status(200).send({
+      message: `User role updated to ${role}`,
+      role,
+    });
+  } catch (error) {
+    console.error("Update user role error:", error);
+    res.status(500).send({ message: "Failed to update user role" });
+  }
+});
+
+// ==========================================
+// ADMIN: ALL TUITIONS & APPROVAL FLOW
+// ==========================================
+app.get("/admin/tuitions", async (req, res) => {
+  try {
+    const list = await allTuitions.find({}).sort({ createdAt: -1 }).toArray();
+    res.status(200).send(list);
+  } catch (error) {
+    console.error("Admin tuitions fetch error:", error);
+    res.status(500).send({ message: "Failed to fetch tuitions" });
+  }
+});
+
+app.patch("/admin/tuitions/:id/approval", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const status = String(
+      req.body.status || req.body.approvalStatus || "",
+    ).toLowerCase();
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid tuition ID" });
+    }
+
+    if (!["approved", "rejected", "pending"].includes(status)) {
+      return res.status(400).send({
+        message: "Status must be approved, rejected, or pending",
+      });
+    }
+
+    const result = await allTuitions.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          status,
+          approvalStatus: status,
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    if (!result.matchedCount) {
+      return res.status(404).send({ message: "Tuition not found" });
+    }
+
+    res.status(200).send({
+      message: `Tuition ${status}`,
+      status,
+    });
+  } catch (error) {
+    console.error("Tuition approval error:", error);
+    res
+      .status(500)
+      .send({ message: "Failed to update tuition approval status" });
+  }
+});
+
+// ==========================================
+// ADMIN: TRANSACTIONS / PAYMENTS LIST
+// ==========================================
+app.get("/admin/transactions", async (req, res) => {
+  try {
+    const [txList, allUsers] = await Promise.all([
+      payments.find({}).sort({ paymentDate: -1, createdAt: -1 }).toArray(),
+      users.find({}).toArray(),
+    ]);
+
+    const userById = new Map();
+    for (const u of allUsers) {
+      if (u._id) userById.set(String(u._id), u);
+      if (u.id) userById.set(String(u.id), u);
+    }
+
+    const enriched = txList.map((tx) => {
+      const matchedUser = tx.userId ? userById.get(String(tx.userId)) : null;
+      const role = tx.role || matchedUser?.role || "student";
+      const planName =
+        tx.planName ||
+        (role === "tutor" ? "Pro Tutor Plan" : "Pro Student Plan");
+
+      return {
+        ...tx,
+        userName: tx.userName || matchedUser?.name || "Unknown User",
+        userEmail: tx.userEmail || matchedUser?.email || "—",
+        role,
+        planName,
+        transactionId:
+          tx.transactionId ||
+          tx.stripeSubscriptionId ||
+          tx.stripeSessionId ||
+          String(tx._id),
+        paymentDate: tx.paymentDate || tx.createdAt || null,
+      };
+    });
+
+    res.status(200).send(enriched);
+  } catch (error) {
+    console.error("Admin transactions fetch error:", error);
+    res.status(500).send({ message: "Failed to fetch transactions" });
   }
 });
 
