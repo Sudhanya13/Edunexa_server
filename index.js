@@ -1191,6 +1191,7 @@ import express from "express";
 import cors from "cors";
 import "dotenv/config";
 import { MongoClient, ObjectId } from "mongodb";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -1231,6 +1232,72 @@ const allTuitions = db.collection("tuitions");
 const applications = db.collection("applications");
 const savedTuitions = db.collection("savedtuitions");
 const payments = db.collection("payments");
+// const verifyToken = async (req, res, next) => {
+//   try {
+//     const authHeader = req.headers.authorization;
+//     console.log(authHeader);
+
+//     if (!authHeader || !authHeader.startsWith("Bearer ")) {
+//       return res.status(401).send({ msg: "unauthorized!" });
+//     }
+
+//     const token = authHeader.split(" ")[1];
+//     console.log(token);
+
+//     if (!token) {
+//       return res.status(401).send({ msg: "unauthorized!" });
+//     }
+
+//     const JWKS = createRemoteJWKSet(
+//       new URL(`${process.env.CLIENT_URL}/api/auth/jwks`),
+//     );
+
+//     const { payload } = await jwtVerify(token, JWKS);
+
+//     req.user = payload;
+
+//     next();
+//   } catch (err) {
+//     console.error("Token verification failed:", err.message);
+
+//     return res.status(403).send({
+//       message: "Invalid or expired token",
+//       error: err.message,
+//     });
+//   }
+// };
+const verifyToken = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      return res.status(401).send({ msg: "unauthorized!" });
+    }
+
+    const token = authHeader.split(" ")[1];
+
+    if (!token) {
+      return res.status(401).send({ msg: "unauthorized!" });
+    }
+
+    const JWKS = createRemoteJWKSet(
+      new URL(`${process.env.CLIENT_URL}/api/auth/jwks`),
+    );
+
+    const { payload } = await jwtVerify(token, JWKS);
+
+    req.user = payload;
+
+    next();
+  } catch (err) {
+    console.error("Token verification failed:", err.message, err.cause);
+    return res.status(403).send({
+      message: "Invalid or expired token",
+      error: err.message,
+      cause: err.cause?.code || err.cause?.message || String(err.cause || ""),
+    });
+  }
+};
 
 app.get("/", (req, res) => {
   res.send("Hello World!");
@@ -1303,29 +1370,67 @@ app.get("/all-tuitions/:id", async (req, res) => {
     });
   }
 });
+// middleware --
+// const verifyToken = async (req, res, next) => {
+//   try {
+//     // const authHeader = req.headers.authorization;
+//     // console.log(authHeader);
+
+//     // if (authHeader !== "user logged in") {
+//     //   return res.status(401).send({ msg: "unauthorized!" });
+//     // }
+//     // console.log("i am middleware");
+
+//     const token = authHeader.split(" ")[1];
+//     console.log(token);
+//     if (!token) {
+//       return res.status(401).send({ msg: "unauthorized!" });
+//     }
+//     const JWKS = createRemoteJWKSet(
+//       new URL(`${process.env.CLIENT_URL}/api/auth/jwks`),
+//     );
+
+//     const { payload } = await jwtVerify(token, JWKS);
+//     req.user = payload;
+//     next();
+//   } catch (err) {
+//     console.error("Token verification failed:", err.message);
+//     return res.status(403).send({
+//       message: "Invalid or expired token",
+//       error: err.message,
+//     });
+//   }
+
+//   // next();
+// };
 
 // GET: Fetch applications submitted by a student
-app.get("/applications/student/:studentId", async (req, res) => {
-  try {
-    const { studentId } = req.params;
+app.get(
+  "/applications/student/:studentId",
+  verifyToken,
 
-    const result = await applications
-      .find({ studentId })
-      .sort({ createdAt: -1 })
-      .toArray();
+  async (req, res) => {
+    try {
+      const { studentId } = req.params;
 
-    res.status(200).send(result);
-  } catch (error) {
-    console.error("Error fetching student applications:", error);
+      const result = await applications
+        .find({ studentId })
+        .sort({ createdAt: -1 })
+        .toArray();
 
-    res.status(500).send({
-      message: "Failed to fetch applications",
-    });
-  }
-});
+      res.status(200).send(result);
+    } catch (error) {
+      console.error("Error fetching student applications:", error);
+
+      res.status(500).send({
+        message: "Failed to fetch applications",
+      });
+    }
+  },
+);
 
 // Get student applications count
-app.get("/applications/student/:studentId/count", async (req, res) => {
+app.get("/applications/student/:studentId/count", verifyToken, async (req, res) => {
   try {
     const { studentId } = req.params;
 
@@ -1344,7 +1449,7 @@ app.get("/applications/student/:studentId/count", async (req, res) => {
 });
 
 // GET: Check whether a student has applied for a tuition
-app.get("/applications/check/:studentId/:tuitionId", async (req, res) => {
+app.get("/applications/check/:studentId/:tuitionId", verifyToken, async (req, res) => {
   try {
     const { studentId, tuitionId } = req.params;
 
@@ -1366,7 +1471,7 @@ app.get("/applications/check/:studentId/:tuitionId", async (req, res) => {
 });
 
 // POST: Submit tuition application
-app.post("/applications", async (req, res) => {
+app.post("/applications", verifyToken, async (req, res) => {
   try {
     const {
       tuitionId,
@@ -1449,7 +1554,7 @@ app.post("/applications", async (req, res) => {
 });
 
 // GET: Fetch all saved tuitions for a student
-app.get("/saved-tuitions/student/:studentId", async (req, res) => {
+app.get("/saved-tuitions/student/:studentId", verifyToken, async (req, res) => {
   try {
     const { studentId } = req.params;
 
@@ -1489,7 +1594,7 @@ app.get("/saved-tuitions/student/:studentId", async (req, res) => {
 });
 
 // GET: Count saved tuitions for a student
-app.get("/saved-tuitions/student/:studentId/count", async (req, res) => {
+app.get("/saved-tuitions/student/:studentId/count", verifyToken, async (req, res) => {
   try {
     const { studentId } = req.params;
 
@@ -1510,7 +1615,7 @@ app.get("/saved-tuitions/student/:studentId/count", async (req, res) => {
 });
 
 // POST: Save tuition
-app.post("/saved-tuitions", async (req, res) => {
+app.post("/saved-tuitions", verifyToken, async (req, res) => {
   try {
     const { studentId, studentEmail, tuitionId } = req.body;
 
@@ -1593,35 +1698,39 @@ app.post("/saved-tuitions", async (req, res) => {
   }
 });
 
-app.delete("/saved-tuitions/:studentId/:tuitionId", async (req, res) => {
-  try {
-    const { studentId, tuitionId } = req.params;
+app.delete(
+  "/saved-tuitions/:studentId/:tuitionId",
+  verifyToken,
+  async (req, res) => {
+    try {
+      const { studentId, tuitionId } = req.params;
 
-    const result = await savedTuitions.deleteOne({
-      studentId,
-      tuitionId,
-    });
+      const result = await savedTuitions.deleteOne({
+        studentId,
+        tuitionId,
+      });
 
-    if (result.deletedCount === 0) {
-      return res.status(404).send({
-        message: "Saved tuition not found",
+      if (result.deletedCount === 0) {
+        return res.status(404).send({
+          message: "Saved tuition not found",
+        });
+      }
+
+      res.status(200).send({
+        message: "Tuition removed from saved list",
+      });
+    } catch (error) {
+      console.error("Error removing saved tuition:", error);
+
+      res.status(500).send({
+        message: "Failed to remove saved tuition",
       });
     }
-
-    res.status(200).send({
-      message: "Tuition removed from saved list",
-    });
-  } catch (error) {
-    console.error("Error removing saved tuition:", error);
-
-    res.status(500).send({
-      message: "Failed to remove saved tuition",
-    });
-  }
-});
+  },
+);
 
 // GET: Tutor tuition posting statistics
-app.get("/tuitions/my/count", async (req, res) => {
+app.get("/tuitions/my/count", verifyToken, async (req, res) => {
   try {
     const email = String(req.query.email || "")
       .trim()
@@ -1651,7 +1760,7 @@ app.get("/tuitions/my/count", async (req, res) => {
 });
 
 // POST: Create a new tuition
-app.post("/tuitions", async (req, res) => {
+app.post("/tuitions", verifyToken, async (req, res) => {
   try {
     const {
       title,
@@ -1807,7 +1916,7 @@ app.post("/tuitions", async (req, res) => {
 // ==========================================
 // TUTOR: GET MY TUITION POSTS
 // ==========================================
-app.get("/tuitions/my", async (req, res) => {
+app.get("/tuitions/my", verifyToken, async (req, res) => {
   try {
     const email = String(req.query.email || "")
       .trim()
@@ -1829,7 +1938,7 @@ app.get("/tuitions/my", async (req, res) => {
 // ==========================================
 // TUTOR: DASHBOARD STATISTICS
 // ==========================================
-app.get("/tuitions/my/stats", async (req, res) => {
+app.get("/tuitions/my/stats", verifyToken, async (req, res) => {
   try {
     const email = String(req.query.email || "")
       .trim()
@@ -1872,7 +1981,7 @@ app.get("/tuitions/my/stats", async (req, res) => {
 // ==========================================
 // TUTOR: EDIT TUITION
 // ==========================================
-app.put("/tuitions/:id", async (req, res) => {
+app.put("/tuitions/:id", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -2001,7 +2110,7 @@ app.put("/tuitions/:id", async (req, res) => {
 // ==========================================
 // TUTOR: DELETE TUITION
 // ==========================================
-app.delete("/tuitions/:id", async (req, res) => {
+app.delete("/tuitions/:id", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -2040,7 +2149,7 @@ app.delete("/tuitions/:id", async (req, res) => {
 // ==========================================
 // TUTOR: TOGGLE ACTIVE / CLOSED
 // ==========================================
-app.patch("/tuitions/:id/status", async (req, res) => {
+app.patch("/tuitions/:id/status", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { isActive } = req.body;
@@ -2084,7 +2193,7 @@ app.patch("/tuitions/:id/status", async (req, res) => {
 // ==========================================
 // TUTOR: GET ALL APPLICANTS
 // ==========================================
-app.get("/tutor/applicants", async (req, res) => {
+app.get("/tutor/applicants", verifyToken, async (req, res) => {
   try {
     const email = String(req.query.email || "")
       .trim()
@@ -2106,7 +2215,7 @@ app.get("/tutor/applicants", async (req, res) => {
 // ==========================================
 // TUTOR: ACCEPT / REJECT APPLICATION
 // ==========================================
-app.patch("/applications/:id/status", async (req, res) => {
+app.patch("/applications/:id/status", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
@@ -2154,7 +2263,7 @@ app.patch("/applications/:id/status", async (req, res) => {
 });
 
 // POST: Confirm successful Stripe payment and upgrade user to Pro
-app.post("/payments/confirm", async (req, res) => {
+app.post("/payments/confirm", verifyToken, async (req, res) => {
   try {
     const { sessionId } = req.body;
 
@@ -2248,7 +2357,7 @@ app.post("/payments/confirm", async (req, res) => {
 // ==========================================
 // ADMIN: DASHBOARD OVERVIEW STATS
 // ==========================================
-app.get("/admin/stats", async (req, res) => {
+app.get("/admin/stats", verifyToken, async (req, res) => {
   try {
     const [
       totalUsers,
@@ -2288,7 +2397,7 @@ app.get("/admin/stats", async (req, res) => {
 // ==========================================
 // ADMIN: USER MANAGEMENT (LIST & ROLE UPDATE)
 // ==========================================
-app.get("/admin/users", async (req, res) => {
+app.get("/admin/users", verifyToken, async (req, res) => {
   try {
     const list = await users.find({}).sort({ createdAt: -1 }).toArray();
     res.status(200).send(list);
@@ -2298,7 +2407,7 @@ app.get("/admin/users", async (req, res) => {
   }
 });
 
-app.patch("/admin/users/:id/role", async (req, res) => {
+app.patch("/admin/users/:id/role", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const role = String(req.body.role || "").toLowerCase();
@@ -2338,7 +2447,7 @@ app.patch("/admin/users/:id/role", async (req, res) => {
 // ==========================================
 // ADMIN: ALL TUITIONS & APPROVAL FLOW
 // ==========================================
-app.get("/admin/tuitions", async (req, res) => {
+app.get("/admin/tuitions", verifyToken, async (req, res) => {
   try {
     const list = await allTuitions.find({}).sort({ createdAt: -1 }).toArray();
     res.status(200).send(list);
@@ -2348,7 +2457,7 @@ app.get("/admin/tuitions", async (req, res) => {
   }
 });
 
-app.patch("/admin/tuitions/:id/approval", async (req, res) => {
+app.patch("/admin/tuitions/:id/approval", verifyToken, async (req, res) => {
   try {
     const { id } = req.params;
     const status = String(
@@ -2395,7 +2504,7 @@ app.patch("/admin/tuitions/:id/approval", async (req, res) => {
 // ==========================================
 // ADMIN: TRANSACTIONS / PAYMENTS LIST
 // ==========================================
-app.get("/admin/transactions", async (req, res) => {
+app.get("/admin/transactions", verifyToken, async (req, res) => {
   try {
     const [txList, allUsers] = await Promise.all([
       payments.find({}).sort({ paymentDate: -1, createdAt: -1 }).toArray(),
