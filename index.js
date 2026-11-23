@@ -1192,15 +1192,34 @@ import cors from "cors";
 import "dotenv/config";
 import { MongoClient, ObjectId } from "mongodb";
 import { createRemoteJWKSet, jwtVerify } from "jose";
+import Stripe from "stripe";
 
 const app = express();
 const port = process.env.PORT || 5000;
+const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
+const stripe = stripeSecretKey ? new Stripe(stripeSecretKey) : null;
 
 // Middleware
 app.use(
   cors({
-    origin: ["http://localhost:3000", "https://my-edunexa.vercel.app"],
+    origin: (origin, callback) => {
+      const allowedOrigins = [
+        "http://localhost:3000",
+        "https://my-edunexa.vercel.app",
+        process.env.CLIENT_URL,
+        process.env.FRONTEND_URL,
+      ].filter(Boolean);
+
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("Origin not allowed by CORS"));
+      }
+    },
     methods: ["GET", "POST", "PATCH", "DELETE", "PUT"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    preflightContinue: false,
+    optionsSuccessStatus: 204,
     credentials: true,
   }),
 );
@@ -1232,7 +1251,7 @@ const allTuitions = db.collection("tuitions");
 const applications = db.collection("applications");
 const savedTuitions = db.collection("savedtuitions");
 const payments = db.collection("payments");
-// const verifyToken = async (req, res, next) => {
+
 //   try {
 //     const authHeader = req.headers.authorization;
 //     console.log(authHeader);
@@ -1280,9 +1299,11 @@ const verifyToken = async (req, res, next) => {
       return res.status(401).send({ msg: "unauthorized!" });
     }
 
-    const JWKS = createRemoteJWKSet(
-      new URL(`${process.env.CLIENT_URL}/api/auth/jwks`),
-    );
+    const clientUrl =
+      process.env.CLIENT_URL ||
+      process.env.FRONTEND_URL ||
+      "http://localhost:3000";
+    const JWKS = createRemoteJWKSet(new URL(`${clientUrl}/api/auth/jwks`));
 
     const { payload } = await jwtVerify(token, JWKS);
 
@@ -1299,11 +1320,91 @@ const verifyToken = async (req, res, next) => {
   }
 };
 
+async function attachDbUser(req, res, next) {
+  try {
+    const email = req.user?.email?.toLowerCase();
+    const tokenUserId = req.user?.sub || req.user?.id;
+
+    let dbUser = null;
+    if (email) {
+      dbUser = await users.findOne({ email });
+    }
+    if (!dbUser && tokenUserId) {
+      dbUser = await users.findOne(
+        ObjectId.isValid(tokenUserId)
+          ? {
+              $or: [
+                { _id: new ObjectId(tokenUserId) },
+                { _id: tokenUserId },
+                { id: tokenUserId },
+              ],
+            }
+          : { $or: [{ _id: tokenUserId }, { id: tokenUserId }] },
+      );
+    }
+
+    if (!dbUser) {
+      return res.status(401).send({ message: "User account not found" });
+    }
+
+    req.dbUser = dbUser;
+    next();
+  } catch (err) {
+    console.error("attachDbUser error:", err);
+    res.status(500).send({ message: "Failed to verify user role" });
+  }
+}
+
+const verifyAdmin = [
+  verifyToken,
+  attachDbUser,
+  (req, res, next) => {
+    if (String(req.dbUser.role || "").toLowerCase() !== "admin") {
+      return res
+        .status(403)
+        .send({ message: "Forbidden: Admin access required" });
+    }
+    next();
+  },
+];
+
+const verifyTutor = [
+  verifyToken,
+  attachDbUser,
+  (req, res, next) => {
+    const role = String(req.dbUser.role || "").toLowerCase();
+    if (role !== "tutor" && role !== "admin") {
+      return res
+        .status(403)
+        .send({ message: "Forbidden: Tutor access required" });
+    }
+    next();
+  },
+];
+
+const verifyStudent = [
+  verifyToken,
+  attachDbUser,
+  (req, res, next) => {
+    const role = String(req.dbUser.role || "").toLowerCase();
+    if (role !== "student" && role !== "admin") {
+      return res
+        .status(403)
+        .send({ message: "Forbidden: Student access required" });
+    }
+    next();
+  },
+];
+
+function getDbUserId(dbUser) {
+  return String(dbUser?.id || dbUser?._id || "");
+}
+
 app.get("/", (req, res) => {
   res.send("Hello World!");
 });
 
-app.get("/users", async (req, res) => {
+app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
   const cursor = users.find({});
   const result = await cursor.toArray();
   res.send(result);
@@ -1407,11 +1508,16 @@ app.get("/all-tuitions/:id", async (req, res) => {
 // GET: Fetch applications submitted by a student
 app.get(
   "/applications/student/:studentId",
-  verifyToken,
+  verifyStudent,
 
   async (req, res) => {
     try {
       const { studentId } = req.params;
+      if (studentId !== getDbUserId(req.dbUser)) {
+        return res.status(403).send({
+          message: "Forbidden: Cannot access another student's applications",
+        });
+      }
 
       const result = await applications
         .find({ studentId })
@@ -1430,48 +1536,66 @@ app.get(
 );
 
 // Get student applications count
-app.get("/applications/student/:studentId/count", verifyToken, async (req, res) => {
-  try {
-    const { studentId } = req.params;
+app.get(
+  "/applications/student/:studentId/count",
+  verifyStudent,
+  async (req, res) => {
+    try {
+      const { studentId } = req.params;
+      if (studentId !== getDbUserId(req.dbUser)) {
+        return res.status(403).send({
+          message: "Forbidden: Cannot access another student's applications",
+        });
+      }
 
-    const count = await applications.countDocuments({ studentId });
+      const count = await applications.countDocuments({ studentId });
 
-    res.status(200).send({
-      count,
-    });
-  } catch (error) {
-    console.error("Error counting student applications:", error);
+      res.status(200).send({
+        count,
+      });
+    } catch (error) {
+      console.error("Error counting student applications:", error);
 
-    res.status(500).send({
-      message: "Failed to count applications",
-    });
-  }
-});
+      res.status(500).send({
+        message: "Failed to count applications",
+      });
+    }
+  },
+);
 
 // GET: Check whether a student has applied for a tuition
-app.get("/applications/check/:studentId/:tuitionId", verifyToken, async (req, res) => {
-  try {
-    const { studentId, tuitionId } = req.params;
+app.get(
+  "/applications/check/:studentId/:tuitionId",
+  verifyStudent,
+  async (req, res) => {
+    try {
+      const { studentId, tuitionId } = req.params;
+      if (studentId !== getDbUserId(req.dbUser)) {
+        return res.status(403).send({
+          message: "Forbidden: Cannot access another student's applications",
+        });
+      }
 
-    const application = await applications.findOne({
-      studentId,
-      tuitionId,
-    });
+      const application = await applications.findOne({
+        studentId,
+        tuitionId,
+      });
 
-    res.status(200).send({
-      hasApplied: Boolean(application),
-    });
-  } catch (error) {
-    console.error("Application check error:", error);
+      res.status(200).send({
+        hasApplied: Boolean(application),
+      });
+    } catch (error) {
+      console.error("Application check error:", error);
 
-    res.status(500).send({
-      message: "Failed to check application status",
-    });
-  }
-});
+      res.status(500).send({
+        message: "Failed to check application status",
+      });
+    }
+  },
+);
 
 // POST: Submit tuition application
-app.post("/applications", verifyToken, async (req, res) => {
+app.post("/applications", verifyStudent, async (req, res) => {
   try {
     const {
       tuitionId,
@@ -1482,6 +1606,17 @@ app.post("/applications", verifyToken, async (req, res) => {
       institution,
       message,
     } = req.body;
+
+    if (
+      String(studentId) !== getDbUserId(req.dbUser) ||
+      String(studentEmail).toLowerCase() !==
+        String(req.dbUser.email).toLowerCase()
+    ) {
+      return res.status(403).send({
+        message:
+          "Forbidden: Application identity does not match the authenticated user",
+      });
+    }
 
     if (
       !tuitionId ||
@@ -1554,70 +1689,98 @@ app.post("/applications", verifyToken, async (req, res) => {
 });
 
 // GET: Fetch all saved tuitions for a student
-app.get("/saved-tuitions/student/:studentId", verifyToken, async (req, res) => {
-  try {
-    const { studentId } = req.params;
+app.get(
+  "/saved-tuitions/student/:studentId",
+  verifyStudent,
+  async (req, res) => {
+    try {
+      const { studentId } = req.params;
+      if (studentId !== getDbUserId(req.dbUser)) {
+        return res.status(403).send({
+          message: "Forbidden: Cannot access another student's saved tuitions",
+        });
+      }
 
-    const saved = await savedTuitions
-      .find({ studentId })
-      .sort({ savedAt: -1 })
-      .toArray();
+      const saved = await savedTuitions
+        .find({ studentId })
+        .sort({ savedAt: -1 })
+        .toArray();
 
-    const tuitionIds = saved
-      .filter((item) => ObjectId.isValid(String(item.tuitionId)))
-      .map((item) => new ObjectId(String(item.tuitionId)));
+      const tuitionIds = saved
+        .filter((item) => ObjectId.isValid(String(item.tuitionId)))
+        .map((item) => new ObjectId(String(item.tuitionId)));
 
-    const tuitions = await allTuitions
-      .find({ _id: { $in: tuitionIds } })
-      .toArray();
+      const tuitions = await allTuitions
+        .find({ _id: { $in: tuitionIds } })
+        .toArray();
 
-    const tuitionMap = new Map(
-      tuitions.map((tuition) => [tuition._id.toString(), tuition]),
-    );
+      const tuitionMap = new Map(
+        tuitions.map((tuition) => [tuition._id.toString(), tuition]),
+      );
 
-    const result = saved.map((item) => ({
-      ...item,
-      tuition: tuitionMap.get(String(item.tuitionId)) || null,
-    }));
+      const result = saved.map((item) => ({
+        ...item,
+        tuition: tuitionMap.get(String(item.tuitionId)) || null,
+      }));
 
-    res.status(200).send({
-      count: result.length,
-      savedTuitions: result,
-    });
-  } catch (error) {
-    console.error("Error fetching saved tuitions:", error);
+      res.status(200).send({
+        count: result.length,
+        savedTuitions: result,
+      });
+    } catch (error) {
+      console.error("Error fetching saved tuitions:", error);
 
-    res.status(500).send({
-      message: "Failed to fetch saved tuitions",
-    });
-  }
-});
+      res.status(500).send({
+        message: "Failed to fetch saved tuitions",
+      });
+    }
+  },
+);
 
 // GET: Count saved tuitions for a student
-app.get("/saved-tuitions/student/:studentId/count", verifyToken, async (req, res) => {
-  try {
-    const { studentId } = req.params;
+app.get(
+  "/saved-tuitions/student/:studentId/count",
+  verifyStudent,
+  async (req, res) => {
+    try {
+      const { studentId } = req.params;
+      if (studentId !== getDbUserId(req.dbUser)) {
+        return res.status(403).send({
+          message: "Forbidden: Cannot access another student's saved tuitions",
+        });
+      }
 
-    const count = await savedTuitions.countDocuments({
-      studentId,
-    });
+      const count = await savedTuitions.countDocuments({
+        studentId,
+      });
 
-    res.status(200).send({
-      count,
-    });
-  } catch (error) {
-    console.error("Error counting saved tuitions:", error);
+      res.status(200).send({
+        count,
+      });
+    } catch (error) {
+      console.error("Error counting saved tuitions:", error);
 
-    res.status(500).send({
-      message: "Failed to count saved tuitions",
-    });
-  }
-});
+      res.status(500).send({
+        message: "Failed to count saved tuitions",
+      });
+    }
+  },
+);
 
 // POST: Save tuition
-app.post("/saved-tuitions", verifyToken, async (req, res) => {
+app.post("/saved-tuitions", verifyStudent, async (req, res) => {
   try {
     const { studentId, studentEmail, tuitionId } = req.body;
+    if (
+      String(studentId) !== getDbUserId(req.dbUser) ||
+      String(studentEmail).toLowerCase() !==
+        String(req.dbUser.email).toLowerCase()
+    ) {
+      return res.status(403).send({
+        message:
+          "Forbidden: Saved tuition identity does not match the authenticated user",
+      });
+    }
 
     if (!studentId || !studentEmail || !tuitionId) {
       return res.status(400).send({
@@ -1700,10 +1863,15 @@ app.post("/saved-tuitions", verifyToken, async (req, res) => {
 
 app.delete(
   "/saved-tuitions/:studentId/:tuitionId",
-  verifyToken,
+  verifyStudent,
   async (req, res) => {
     try {
       const { studentId, tuitionId } = req.params;
+      if (studentId !== getDbUserId(req.dbUser)) {
+        return res.status(403).send({
+          message: "Forbidden: Cannot modify another student's saved tuitions",
+        });
+      }
 
       const result = await savedTuitions.deleteOne({
         studentId,
@@ -1730,18 +1898,16 @@ app.delete(
 );
 
 // GET: Tutor tuition posting statistics
-app.get("/tuitions/my/count", verifyToken, async (req, res) => {
+app.get("/tuitions/my/count", verifyTutor, async (req, res) => {
   try {
-    const email = String(req.query.email || "")
+    const email = String(req.dbUser.email || "")
       .trim()
       .toLowerCase();
     const filter = email ? { tutorEmail: email } : {};
 
     const count = await allTuitions.countDocuments(filter);
     const userDoc = email ? await users.findOne({ email }) : null;
-    const plan = String(
-      req.query.plan || userDoc?.plan || "free",
-    ).toLowerCase();
+    const plan = String(userDoc?.plan || "free").toLowerCase();
 
     res.status(200).send({
       count,
@@ -1760,7 +1926,7 @@ app.get("/tuitions/my/count", verifyToken, async (req, res) => {
 });
 
 // POST: Create a new tuition
-app.post("/tuitions", verifyToken, async (req, res) => {
+app.post("/tuitions", verifyTutor, async (req, res) => {
   try {
     const {
       title,
@@ -1852,14 +2018,15 @@ app.post("/tuitions", verifyToken, async (req, res) => {
     }
 
     // 6. Resolve tutor details without session auth
-    const normalizedEmail = String(tutorEmail || "")
+    const normalizedEmail = String(req.dbUser.email || "")
       .trim()
       .toLowerCase();
-    const resolvedName = String(tutorName || "").trim() || "Tutor";
+    const resolvedName =
+      String(req.dbUser.name || tutorName || "").trim() || "Tutor";
     const userDoc = normalizedEmail
       ? await users.findOne({ email: normalizedEmail })
       : null;
-    const plan = String(bodyPlan || userDoc?.plan || "free").toLowerCase();
+    const plan = String(userDoc?.plan || "free").toLowerCase();
 
     // 7. Check existing posts if email is provided
     const existingCount = normalizedEmail
@@ -1936,11 +2103,37 @@ app.get("/tuitions/my", verifyToken, async (req, res) => {
 });
 
 // ==========================================
+// TUTOR: GET ALL APPLICANTS (OWN TUITIONS ONLY)
+// ==========================================
+app.get("/tutor/applicants", verifyTutor, async (req, res) => {
+  try {
+    const tutorEmail = req.dbUser.email.toLowerCase();
+    const myTuitionIds = (
+      await allTuitions
+        .find({ tutorEmail }, { projection: { _id: 1 } })
+        .toArray()
+    ).map((t) => t._id.toString());
+
+    const result = await applications
+      .find({
+        $or: [{ tutorEmail }, { tuitionId: { $in: myTuitionIds } }],
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.status(200).send(result);
+  } catch (error) {
+    console.error("Fetch applicants error:", error);
+    res.status(500).send({ message: "Failed to fetch applicants" });
+  }
+});
+
+// ==========================================
 // TUTOR: DASHBOARD STATISTICS
 // ==========================================
-app.get("/tuitions/my/stats", verifyToken, async (req, res) => {
+app.get("/tuitions/my/stats", verifyTutor, async (req, res) => {
   try {
-    const email = String(req.query.email || "")
+    const email = String(req.dbUser.email || "")
       .trim()
       .toLowerCase();
     const filter = email ? { tutorEmail: email } : {};
@@ -1970,7 +2163,7 @@ app.get("/tuitions/my/stats", verifyToken, async (req, res) => {
       totalTuitions,
       activeTuitions,
       totalApplicants,
-      plan: String(req.query.plan || userDoc?.plan || "free").toLowerCase(),
+      plan: String(userDoc?.plan || "free").toLowerCase(),
     });
   } catch (error) {
     console.error("Tutor stats error:", error);
@@ -1981,7 +2174,7 @@ app.get("/tuitions/my/stats", verifyToken, async (req, res) => {
 // ==========================================
 // TUTOR: EDIT TUITION
 // ==========================================
-app.put("/tuitions/:id", verifyToken, async (req, res) => {
+app.put("/tuitions/:id", verifyTutor, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -2049,6 +2242,9 @@ app.put("/tuitions/:id", verifyToken, async (req, res) => {
 
     const existing = await allTuitions.findOne({
       _id: new ObjectId(id),
+      tutorEmail: String(req.dbUser.email || "")
+        .trim()
+        .toLowerCase(),
     });
 
     if (!existing) {
@@ -2081,6 +2277,9 @@ app.put("/tuitions/:id", verifyToken, async (req, res) => {
     await allTuitions.updateOne(
       {
         _id: new ObjectId(id),
+        tutorEmail: String(req.dbUser.email || "")
+          .trim()
+          .toLowerCase(),
       },
       {
         $set: {
@@ -2110,7 +2309,7 @@ app.put("/tuitions/:id", verifyToken, async (req, res) => {
 // ==========================================
 // TUTOR: DELETE TUITION
 // ==========================================
-app.delete("/tuitions/:id", verifyToken, async (req, res) => {
+app.delete("/tuitions/:id", verifyTutor, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -2120,6 +2319,9 @@ app.delete("/tuitions/:id", verifyToken, async (req, res) => {
 
     const tuition = await allTuitions.findOne({
       _id: new ObjectId(id),
+      tutorEmail: String(req.dbUser.email || "")
+        .trim()
+        .toLowerCase(),
     });
 
     if (!tuition) {
@@ -2149,7 +2351,7 @@ app.delete("/tuitions/:id", verifyToken, async (req, res) => {
 // ==========================================
 // TUTOR: TOGGLE ACTIVE / CLOSED
 // ==========================================
-app.patch("/tuitions/:id/status", verifyToken, async (req, res) => {
+app.patch("/tuitions/:id/status", verifyTutor, async (req, res) => {
   try {
     const { id } = req.params;
     const { isActive } = req.body;
@@ -2167,6 +2369,9 @@ app.patch("/tuitions/:id/status", verifyToken, async (req, res) => {
     const result = await allTuitions.updateOne(
       {
         _id: new ObjectId(id),
+        tutorEmail: String(req.dbUser.email || "")
+          .trim()
+          .toLowerCase(),
       },
       {
         $set: {
@@ -2191,80 +2396,91 @@ app.patch("/tuitions/:id/status", verifyToken, async (req, res) => {
 });
 
 // ==========================================
-// TUTOR: GET ALL APPLICANTS
-// ==========================================
-app.get("/tutor/applicants", verifyToken, async (req, res) => {
-  try {
-    const email = String(req.query.email || "")
-      .trim()
-      .toLowerCase();
-    const filter = email ? { tutorEmail: email } : {};
-
-    const result = await applications
-      .find(filter)
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    res.status(200).send(result);
-  } catch (error) {
-    console.error("Fetch applicants error:", error);
-    res.status(500).send({ message: "Failed to fetch applicants" });
-  }
-});
-
-// ==========================================
 // TUTOR: ACCEPT / REJECT APPLICATION
 // ==========================================
-app.patch("/applications/:id/status", verifyToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const { status } = req.body;
+app.patch(
+  "/applications/:id/status",
+  verifyToken,
+  verifyTutor,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { status } = req.body;
 
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).send({ message: "Invalid application ID" });
-    }
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({ message: "Invalid application ID" });
+      }
 
-    const normalizedStatus = String(status || "").toLowerCase();
+      const normalizedStatus = String(status || "").toLowerCase();
 
-    if (!["accepted", "rejected"].includes(normalizedStatus)) {
-      return res.status(400).send({
-        message: "Status must be accepted or rejected",
-      });
-    }
+      if (!["accepted", "rejected"].includes(normalizedStatus)) {
+        return res.status(400).send({
+          message: "Status must be accepted or rejected",
+        });
+      }
 
-    const result = await applications.updateOne(
-      {
+      const application = await applications.findOne({
         _id: new ObjectId(id),
-      },
-      {
-        $set: {
-          status: normalizedStatus,
-          updatedAt: new Date(),
-        },
-      },
-    );
+      });
+      if (!application) {
+        return res.status(404).send({
+          message: "Application not found",
+        });
+      }
 
-    if (!result.matchedCount) {
-      return res.status(404).send({
-        message: "Application not found",
+      const isAdmin = String(req.dbUser.role || "").toLowerCase() === "admin";
+      const tutorEmail = String(req.dbUser.email || "")
+        .trim()
+        .toLowerCase();
+      if (
+        !isAdmin &&
+        String(application.tutorEmail || "").toLowerCase() !== tutorEmail
+      ) {
+        return res.status(403).send({
+          message: "Forbidden: You cannot manage this application",
+        });
+      }
+
+      const result = await applications.updateOne(
+        {
+          _id: new ObjectId(id),
+        },
+        {
+          $set: {
+            status: normalizedStatus,
+            updatedAt: new Date(),
+          },
+        },
+      );
+
+      if (!result.matchedCount) {
+        return res.status(404).send({
+          message: "Application not found",
+        });
+      }
+
+      res.status(200).send({
+        message: `Application ${normalizedStatus} successfully`,
+        status: normalizedStatus,
+      });
+    } catch (error) {
+      console.error("Update application status error:", error);
+      res.status(500).send({
+        message: "Failed to update application status",
       });
     }
-
-    res.status(200).send({
-      message: `Application ${normalizedStatus} successfully`,
-      status: normalizedStatus,
-    });
-  } catch (error) {
-    console.error("Update application status error:", error);
-    res.status(500).send({
-      message: "Failed to update application status",
-    });
-  }
-});
+  },
+);
 
 // POST: Confirm successful Stripe payment and upgrade user to Pro
-app.post("/payments/confirm", verifyToken, async (req, res) => {
+app.post("/payments/confirm", verifyToken, attachDbUser, async (req, res) => {
   try {
+    if (!stripe) {
+      return res.status(503).send({
+        message: "Stripe is not configured on the server",
+      });
+    }
+
     const { sessionId } = req.body;
 
     if (!sessionId) {
@@ -2294,6 +2510,13 @@ app.post("/payments/confirm", verifyToken, async (req, res) => {
     if (!userId || !["student", "tutor"].includes(role)) {
       return res.status(400).send({
         message: "Invalid user or subscription details",
+      });
+    }
+
+    const authenticatedUserId = String(req.dbUser.id || req.dbUser._id || "");
+    if (authenticatedUserId !== String(userId)) {
+      return res.status(403).send({
+        message: "Forbidden: Checkout belongs to another user",
       });
     }
 
@@ -2357,7 +2580,7 @@ app.post("/payments/confirm", verifyToken, async (req, res) => {
 // ==========================================
 // ADMIN: DASHBOARD OVERVIEW STATS
 // ==========================================
-app.get("/admin/stats", verifyToken, async (req, res) => {
+app.get("/admin/stats", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const [
       totalUsers,
@@ -2397,7 +2620,7 @@ app.get("/admin/stats", verifyToken, async (req, res) => {
 // ==========================================
 // ADMIN: USER MANAGEMENT (LIST & ROLE UPDATE)
 // ==========================================
-app.get("/admin/users", verifyToken, async (req, res) => {
+app.get("/admin/users", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const list = await users.find({}).sort({ createdAt: -1 }).toArray();
     res.status(200).send(list);
@@ -2407,47 +2630,52 @@ app.get("/admin/users", verifyToken, async (req, res) => {
   }
 });
 
-app.patch("/admin/users/:id/role", verifyToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const role = String(req.body.role || "").toLowerCase();
+app.patch(
+  "/admin/users/:id/role",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const role = String(req.body.role || "").toLowerCase();
 
-    if (!["student", "tutor", "admin"].includes(role)) {
-      return res.status(400).send({
-        message: "Role must be student, tutor, or admin",
+      if (!["student", "tutor", "admin"].includes(role)) {
+        return res.status(400).send({
+          message: "Role must be student, tutor, or admin",
+        });
+      }
+
+      // BetterAuth Mongo adapter can store `id` as string or `_id` as ObjectId/string
+      const filter = ObjectId.isValid(id)
+        ? { $or: [{ _id: new ObjectId(id) }, { _id: id }, { id }] }
+        : { $or: [{ _id: id }, { id }] };
+
+      const result = await users.updateOne(filter, {
+        $set: {
+          role,
+          updatedAt: new Date(),
+        },
       });
-    }
 
-    // BetterAuth Mongo adapter can store `id` as string or `_id` as ObjectId/string
-    const filter = ObjectId.isValid(id)
-      ? { $or: [{ _id: new ObjectId(id) }, { _id: id }, { id }] }
-      : { $or: [{ _id: id }, { id }] };
+      if (!result.matchedCount) {
+        return res.status(404).send({ message: "User not found" });
+      }
 
-    const result = await users.updateOne(filter, {
-      $set: {
+      res.status(200).send({
+        message: `User role updated to ${role}`,
         role,
-        updatedAt: new Date(),
-      },
-    });
-
-    if (!result.matchedCount) {
-      return res.status(404).send({ message: "User not found" });
+      });
+    } catch (error) {
+      console.error("Update user role error:", error);
+      res.status(500).send({ message: "Failed to update user role" });
     }
-
-    res.status(200).send({
-      message: `User role updated to ${role}`,
-      role,
-    });
-  } catch (error) {
-    console.error("Update user role error:", error);
-    res.status(500).send({ message: "Failed to update user role" });
-  }
-});
+  },
+);
 
 // ==========================================
 // ADMIN: ALL TUITIONS & APPROVAL FLOW
 // ==========================================
-app.get("/admin/tuitions", verifyToken, async (req, res) => {
+app.get("/admin/tuitions", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const list = await allTuitions.find({}).sort({ createdAt: -1 }).toArray();
     res.status(200).send(list);
@@ -2457,54 +2685,59 @@ app.get("/admin/tuitions", verifyToken, async (req, res) => {
   }
 });
 
-app.patch("/admin/tuitions/:id/approval", verifyToken, async (req, res) => {
-  try {
-    const { id } = req.params;
-    const status = String(
-      req.body.status || req.body.approvalStatus || "",
-    ).toLowerCase();
+app.patch(
+  "/admin/tuitions/:id/approval",
+  verifyToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const status = String(
+        req.body.status || req.body.approvalStatus || "",
+      ).toLowerCase();
 
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).send({ message: "Invalid tuition ID" });
-    }
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).send({ message: "Invalid tuition ID" });
+      }
 
-    if (!["approved", "rejected", "pending"].includes(status)) {
-      return res.status(400).send({
-        message: "Status must be approved, rejected, or pending",
-      });
-    }
+      if (!["approved", "rejected", "pending"].includes(status)) {
+        return res.status(400).send({
+          message: "Status must be approved, rejected, or pending",
+        });
+      }
 
-    const result = await allTuitions.updateOne(
-      { _id: new ObjectId(id) },
-      {
-        $set: {
-          status,
-          approvalStatus: status,
-          updatedAt: new Date(),
+      const result = await allTuitions.updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            status,
+            approvalStatus: status,
+            updatedAt: new Date(),
+          },
         },
-      },
-    );
+      );
 
-    if (!result.matchedCount) {
-      return res.status(404).send({ message: "Tuition not found" });
+      if (!result.matchedCount) {
+        return res.status(404).send({ message: "Tuition not found" });
+      }
+
+      res.status(200).send({
+        message: `Tuition ${status}`,
+        status,
+      });
+    } catch (error) {
+      console.error("Tuition approval error:", error);
+      res
+        .status(500)
+        .send({ message: "Failed to update tuition approval status" });
     }
-
-    res.status(200).send({
-      message: `Tuition ${status}`,
-      status,
-    });
-  } catch (error) {
-    console.error("Tuition approval error:", error);
-    res
-      .status(500)
-      .send({ message: "Failed to update tuition approval status" });
-  }
-});
+  },
+);
 
 // ==========================================
 // ADMIN: TRANSACTIONS / PAYMENTS LIST
 // ==========================================
-app.get("/admin/transactions", verifyToken, async (req, res) => {
+app.get("/admin/transactions", verifyToken, verifyAdmin, async (req, res) => {
   try {
     const [txList, allUsers] = await Promise.all([
       payments.find({}).sort({ paymentDate: -1, createdAt: -1 }).toArray(),
@@ -2544,10 +2777,6 @@ app.get("/admin/transactions", verifyToken, async (req, res) => {
     console.error("Admin transactions fetch error:", error);
     res.status(500).send({ message: "Failed to fetch transactions" });
   }
-});
-
-app.listen(port, () => {
-  console.log(`Server is running on port ${port}`);
 });
 
 // // ROLE CHECK: tutor. Own tuitions only (must be before /:id)
@@ -3163,8 +3392,10 @@ app.listen(port, () => {
 // );
 
 // ---------- Start ----------
-app.listen(port, () => {
-  console.log(`Edunexa server listening on port ${port}`);
-});
+if (!process.env.VERCEL) {
+  app.listen(port, () => {
+    console.log(`Edunexa server listening on port ${port}`);
+  });
+}
 
 export default app; // needed if you deploy to Vercel
